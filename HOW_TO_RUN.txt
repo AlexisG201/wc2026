@@ -1,0 +1,34 @@
+== World Cup 2026 Dashboard — Setup Guide ==
+
+REQUIREMENTS
+  • Python 3.8 or higher
+  • Internet connection
+
+STEP 1 — Install dependencies
+  Open a terminal (Command Prompt or PowerShell) in this folder and run:
+
+    pip install -r requirements.txt
+
+STEP 2 — Run the app
+
+    python app.py
+
+  The app will print:
+    🌍  World Cup 2026 Dashboard → http://localhost:5050
+
+  And automatically open your browser. If it doesn't, go to:
+    http://localhost:5050
+
+STEP 3 — Use the dashboard
+  • TODAY      — all matches today (results + live scores)
+  • NEXT 48H   — upcoming scheduled fixtures
+  • STANDINGS  — group tables (top 2 per group highlighted)
+  • BRACKET    — knockout round progression to the Final
+
+  Click ↻ Refresh to pull the latest data at any time.
+  A red LIVE badge appears automatically when matches are in progress.
+
+NOTES
+  • The free API tier allows 10 requests/minute — the app caches responses
+    for 60 seconds to stay within limits.
+  • Leave the terminal open while using the dashboard; close it to stop.
