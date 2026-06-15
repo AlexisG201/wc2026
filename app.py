@@ -39,111 +39,151 @@ def cached_get(url, params=None):
 
 # ── Prediction engine ─────────────────────────────────────────────────────────
 #
-# Method: Bivariate Poisson model (Dixon-Coles style)
-#   1. Convert FIFA ranking → team strength multiplier
-#   2. Expected goals = BASE × attack_strength / opponent_defense_strength
-#   3. Scoreline probabilities from independent Poisson distributions
-#   4. Blend in live tournament stats once teams have played (30% weight)
+# Three upgrades over basic Poisson (as suggested by Gemini):
 #
-# FIFA Rankings: official release of 12 June 2026
-# Source: ESPN / FIFA (June 2026)
+# [1] Elo Ratings (not FIFA rankings)
+#     Source: worldfootballrankings.com, updated June 14 2026.
+#     Elo updates after every match based on result, margin, and opponent strength.
+#     More predictive than ordinal FIFA rankings for this purpose.
+#
+# [2] Dixon-Coles τ correction
+#     Pure Poisson overestimates the frequency of 1-0 and 0-1 scorelines and
+#     underestimates 0-0 and 1-1.  The τ factor corrects low-scoring cells
+#     (0-0, 1-0, 0-1, 1-1) with parameter ρ ≈ -0.13 (empirically fitted).
+#
+# [3] Progressive tournament weighting
+#     Since all stats we have ARE tournament games (the highest-weight context),
+#     we increase their blend weight as teams accumulate more games:
+#       0 games  → pure Elo prior
+#       1 game   → 22 % tournament
+#       2 games  → 44 % tournament
+#       3 games  → 65 % tournament (cap)
 
-FIFA_RANKINGS = {
-    # Top tier
-    "ARG": 1,  "ESP": 2,  "FRA": 3,  "ENG": 4,  "POR": 5,
-    "BRA": 6,  "NED": 7,  "GER": 9,  "CRO": 10, "MAR": 13,
-    # Strong
-    "MEX": 14, "COL": 16, "USA": 17, "URU": 18, "SUI": 19,
-    "SEN": 20, "IRN": 21, "JPN": 22, "AUS": 23, "KOR": 23,
-    "DEN": 24, "AUT": 25, "TUR": 28, "ECU": 29, "CAN": 30,
-    # Mid
-    "NOR": 33, "SCO": 39, "NGA": 40, "EGY": 42, "GRE": 45,
-    "TUN": 47, "SVK": 50, "SLO": 52, "CIV": 53, "CMR": 54,
-    "KSA": 56, "MLI": 57, "GHA": 62, "BIH": 64, "RSA": 68,
-    "PAR": 70, "IRQ": 74, "PAN": 78, "UZB": 79, "PER": 80,
-    "CPV": 82, "BOL": 85, "HON": 88, "NZL": 93, "SLV": 95,
-    # Lower
-    "ZAM": 99, "HAI": 102, "JOR": 104, "CUR": 115,
-    # Additional qualifiers
-    "QAT": 35, "ALG": 36,
+# Elo Ratings — worldfootballrankings.com, June 14 2026
+ELO_RATINGS = {
+    # Top tier (confirmed from live leaderboard)
+    "ARG": 1877, "ESP": 1875, "FRA": 1871, "ENG": 1828, "POR": 1768,
+    "BRA": 1765, "MAR": 1756, "NED": 1754, "BEL": 1742, "GER": 1736,
+    "CRO": 1715, "MEX": 1701, "COL": 1698, "USA": 1689, "SEN": 1684,
+    "URU": 1673, "JPN": 1662, "SUI": 1641, "IRN": 1620, "DEN": 1619,
+    "KOR": 1613, "TUR": 1606, "ECU": 1599, "AUT": 1597, "NGA": 1585,
+    "AUS": 1579, "ALG": 1571, "EGY": 1562, "NOR": 1557, "CAN": 1552,
+    "CIV": 1541, "PAN": 1539, "SCO": 1519, "PAR": 1488, "CMR": 1481,
+    "TUN": 1476, "COD": 1474, "SVK": 1474, "GRE": 1473, "VEN": 1469,
+    "QAT": 1459,
+    # Estimated from context / regional averages
+    "SLO": 1470, "BIH": 1460, "RSA": 1458, "KSA": 1448, "GHA": 1440,
+    "MLI": 1430, "UZB": 1415, "IRQ": 1410, "HAI": 1395, "HON": 1385,
+    "JOR": 1380, "CPV": 1340, "SLV": 1335, "ZAM": 1355, "BOL": 1326,
+    "NZL": 1276, "CUR": 1305,
 }
 
 BASE_GOALS = 1.25   # avg WC group-stage goals per team per game
-MAX_GOALS  = 6      # max goals considered per side in probability grid
-
-def rank_to_strength(rank: int) -> float:
-    """Map FIFA rank (1 = best) to a strength multiplier via exponential decay."""
-    return 0.45 + 1.30 * math.exp(-rank / 38)
+ELO_SCALE  = 700    # calibration: 700 pts → √10 ratio in xG (empirically fitted)
+DC_RHO     = -0.13  # Dixon-Coles ρ (negative → more draws/0-0, fewer 1-0/0-1)
+MAX_GOALS  = 6      # max goals per side in the probability grid
 
 def poisson_pmf(lam: float, k: int) -> float:
     """P(X = k) for X ~ Poisson(lambda)."""
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
+def elo_base_xg(elo_home: float, elo_away: float):
+    """
+    Convert Elo ratings to base expected goals via relative rating difference.
+    Each √10 difference in the strength ratio shifts xG by √(ratio).
+    """
+    diff  = elo_home - elo_away
+    ratio = 10 ** (diff / ELO_SCALE)
+    return BASE_GOALS * math.sqrt(ratio), BASE_GOALS / math.sqrt(ratio)
+
+def dixon_coles_tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
+    """
+    Dixon-Coles correction factor τ for low-scoring scorelines.
+    Applies only to (0,0), (0,1), (1,0), (1,1).
+    """
+    if   x == 0 and y == 0: return 1.0 - lam * mu * rho
+    elif x == 0 and y == 1: return 1.0 + lam * rho
+    elif x == 1 and y == 0: return 1.0 + mu  * rho
+    elif x == 1 and y == 1: return 1.0 - rho
+    else:                   return 1.0
+
 def predict_match(home_tla: str, away_tla: str,
                   home_stats: dict = None, away_stats: dict = None) -> dict:
     """
-    Predict match result using Poisson model.
+    Predict a match using the upgraded three-part model.
 
     Parameters
     ----------
     home_tla / away_tla : 3-letter team code (e.g. "ARG")
     home_stats / away_stats : row from the TOTAL standings table
-        (keys: playedGames, goalsFor, goalsAgainst)
 
     Returns
     -------
     dict with predicted_home, predicted_away, home_win_pct, draw_pct,
          away_win_pct, xg_home, xg_away, confidence
     """
-    h_rank = FIFA_RANKINGS.get(home_tla, 60)
-    a_rank = FIFA_RANKINGS.get(away_tla, 60)
-    h_str  = rank_to_strength(h_rank)
-    a_str  = rank_to_strength(a_rank)
+    # [1] Elo-based prior expected goals
+    h_elo = ELO_RATINGS.get(home_tla, 1450)
+    a_elo = ELO_RATINGS.get(away_tla, 1450)
+    xg_h_prior, xg_a_prior = elo_base_xg(h_elo, a_elo)
 
-    def tournament_attack(stats):
-        """Goals per game in this tournament (None if not played yet)."""
-        if not stats or stats.get("playedGames", 0) == 0:
-            return None
-        return stats["goalsFor"] / stats["playedGames"]
+    # [3] Progressive tournament weighting
+    ph = (home_stats or {}).get("playedGames", 0)
+    pa = (away_stats or {}).get("playedGames", 0)
+    h_tw = min(0.65, ph * 0.22)   # 0→0%, 1→22%, 2→44%, 3→65% (cap)
+    a_tw = min(0.65, pa * 0.22)
 
-    def tournament_defense(stats):
-        """Defense strength derived from goals conceded per game."""
-        if not stats or stats.get("playedGames", 0) == 0:
-            return None
-        ga_pg = stats["goalsAgainst"] / stats["playedGames"]
-        # Invert: fewer goals conceded = stronger defense multiplier
-        return max(0.3, 1.6 - ga_pg * 0.45)
+    def tourn_gf(stats):
+        if not stats or stats.get("playedGames", 0) == 0: return None
+        return stats["goalsFor"]    / stats["playedGames"]
 
-    h_ta = tournament_attack(home_stats)
-    a_ta = tournament_attack(away_stats)
-    h_td = tournament_defense(home_stats)
-    a_td = tournament_defense(away_stats)
+    def tourn_ga(stats):
+        if not stats or stats.get("playedGames", 0) == 0: return None
+        return stats["goalsAgainst"] / stats["playedGames"]
 
-    # Blend FIFA prior (70%) with live tournament data (30%)
-    h_attack  = h_str if h_ta is None else h_str * 0.7 + (h_ta / BASE_GOALS) * 0.3
-    a_attack  = a_str if a_ta is None else a_str * 0.7 + (a_ta / BASE_GOALS) * 0.3
-    h_defense = h_str if h_td is None else h_str * 0.7 + h_td * 0.3
-    a_defense = a_str if a_td is None else a_str * 0.7 + a_td * 0.3
+    h_gf = tourn_gf(home_stats)
+    a_gf = tourn_gf(away_stats)
+    h_ga = tourn_ga(home_stats)
+    a_ga = tourn_ga(away_stats)
 
-    # Expected goals for each side
-    xg_h = max(0.20, min(BASE_GOALS * h_attack / a_defense, 4.5))
-    xg_a = max(0.20, min(BASE_GOALS * a_attack / h_defense, 4.5))
+    # Blend: Elo prior × (1 - weight) + tournament performance × weight
+    # Attack: team's own goals scored; Defence adjustment: opponent's goals conceded
+    if h_gf is not None:
+        xg_h = xg_h_prior * (1 - h_tw) + h_gf * h_tw
+        if a_ga is not None:                           # away team's defensive record
+            def_adj = (a_ga / BASE_GOALS - 1) * a_tw  # positive → leaky defence
+            xg_h   *= (1 + def_adj)
+    else:
+        xg_h = xg_h_prior
 
-    # Build full scoreline probability grid
+    if a_gf is not None:
+        xg_a = xg_a_prior * (1 - a_tw) + a_gf * a_tw
+        if h_ga is not None:
+            def_adj = (h_ga / BASE_GOALS - 1) * h_tw
+            xg_a   *= (1 + def_adj)
+    else:
+        xg_a = xg_a_prior
+
+    xg_h = max(0.15, min(xg_h, 4.5))
+    xg_a = max(0.15, min(xg_a, 4.5))
+
+    # [2] Dixon-Coles corrected probability grid
     grid = {}
     for h in range(MAX_GOALS + 1):
         for a in range(MAX_GOALS + 1):
-            grid[(h, a)] = poisson_pmf(xg_h, h) * poisson_pmf(xg_a, a)
+            p_raw = poisson_pmf(xg_h, h) * poisson_pmf(xg_a, a)
+            tau   = dixon_coles_tau(h, a, xg_h, xg_a, DC_RHO)
+            grid[(h, a)] = max(0.0, p_raw * tau)
+
+    # Renormalise (grid cutoff means probabilities don't sum to exactly 1)
+    total = sum(grid.values()) or 1.0
+    grid  = {k: v / total for k, v in grid.items()}
 
     home_win = sum(p for (h, a), p in grid.items() if h > a)
     draw     = sum(p for (h, a), p in grid.items() if h == a)
     away_win = sum(p for (h, a), p in grid.items() if h < a)
+    best     = max(grid, key=grid.get)
 
-    best = max(grid, key=grid.get)
-
-    # Confidence based on how many games both teams have played
-    ph = (home_stats or {}).get("playedGames", 0)
-    pa = (away_stats or {}).get("playedGames", 0)
     if   ph >= 2 and pa >= 2: confidence = "HIGH"
     elif ph >= 1 or  pa >= 1: confidence = "MEDIUM"
     else:                      confidence = "LOW"
@@ -239,6 +279,29 @@ def bracket():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/recent")
+def recent_matches():
+    """Finished matches in the past 48 hours."""
+    now      = datetime.now(timezone.utc)
+    date_from = (now - timedelta(hours=48)).strftime("%Y-%m-%d")
+    date_to   = now.strftime("%Y-%m-%d")
+    try:
+        data = cached_get(
+            f"{BASE_URL}/competitions/{COMPETITION}/matches",
+            {"season": SEASON, "dateFrom": date_from,
+             "dateTo": date_to, "status": "FINISHED"},
+        )
+        # Sort most-recent first
+        data["matches"] = sorted(
+            data.get("matches", []),
+            key=lambda m: m.get("utcDate", ""),
+            reverse=True,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/live")
 def live_matches():
     try:
@@ -305,12 +368,17 @@ def predictions():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import webbrowser, threading
+    import os
 
-    def open_browser():
-        time.sleep(1)
-        webbrowser.open("http://localhost:5050")
+    port = int(os.environ.get("PORT", 5050))
+    local = os.environ.get("RENDER") is None  # False on Render, True locally
 
-    threading.Thread(target=open_browser, daemon=True).start()
-    print("🌍  World Cup 2026 Dashboard → http://localhost:5050")
-    app.run(port=5050, debug=False)
+    if local:
+        import webbrowser, threading
+        def open_browser():
+            time.sleep(1)
+            webbrowser.open(f"http://localhost:{port}")
+        threading.Thread(target=open_browser, daemon=True).start()
+        print(f"🌍  World Cup 2026 Dashboard → http://localhost:{port}")
+
+    app.run(host="0.0.0.0", port=port, debug=False)
