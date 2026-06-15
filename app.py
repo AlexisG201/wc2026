@@ -20,21 +20,31 @@ SEASON = 2026
 HEADERS = {"X-Auth-Token": API_KEY}
 
 # ── Cache (free tier = 10 req/min) ───────────────────────────────────────────
-_cache   = {}
-CACHE_TTL = 60  # seconds
+_cache        = {}
+CACHE_TTL     = 60      # seconds — for live/list endpoints
+MATCH_CACHE_TTL = 3600  # 1 hour  — finished match details never change
 
-def cached_get(url, params=None):
+def cached_get(url, params=None, ttl=None):
     key = url + str(sorted((params or {}).items()))
     now = time.time()
+    effective_ttl = ttl if ttl is not None else CACHE_TTL
     if key in _cache:
         data, ts = _cache[key]
-        if now - ts < CACHE_TTL:
+        if now - ts < effective_ttl:
             return data
     resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     _cache[key] = (data, now)
     return data
+
+def fetch_match_goals(match_id: int) -> list:
+    """Fetch goal-scorer data for a single finished match (cached 1 hour)."""
+    try:
+        data = cached_get(f"{BASE_URL}/matches/{match_id}", ttl=MATCH_CACHE_TTL)
+        return data.get("goals") or []
+    except Exception:
+        return []
 
 
 # ── Prediction engine ─────────────────────────────────────────────────────────
@@ -281,8 +291,8 @@ def bracket():
 
 @app.route("/api/recent")
 def recent_matches():
-    """Finished matches in the past 48 hours."""
-    now      = datetime.now(timezone.utc)
+    """Finished matches in the past 48 hours, enriched with goal scorers."""
+    now       = datetime.now(timezone.utc)
     date_from = (now - timedelta(hours=48)).strftime("%Y-%m-%d")
     date_to   = now.strftime("%Y-%m-%d")
     try:
@@ -291,12 +301,21 @@ def recent_matches():
             {"season": SEASON, "dateFrom": date_from,
              "dateTo": date_to, "status": "FINISHED"},
         )
-        # Sort most-recent first
-        data["matches"] = sorted(
+        matches = sorted(
             data.get("matches", []),
             key=lambda m: m.get("utcDate", ""),
             reverse=True,
         )
+
+        # Enrich each match with goal data from the individual match endpoint.
+        # We limit to 8 matches to stay well within the 10 req/min free-tier limit
+        # (list call already used 1 slot; 8 individual calls = 9 total).
+        # Individual match data is cached for 1 hour — finished scores never change.
+        for match in matches[:8]:
+            if not match.get("goals"):
+                match["goals"] = fetch_match_goals(match["id"])
+
+        data["matches"] = matches
         return jsonify({"ok": True, "data": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
