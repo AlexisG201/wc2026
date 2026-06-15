@@ -302,6 +302,19 @@ def recent_matches():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/scorers")
+def scorers():
+    """Top 10 goal scorers in the tournament."""
+    try:
+        data = cached_get(
+            f"{BASE_URL}/competitions/{COMPETITION}/scorers",
+            {"season": SEASON, "limit": 10},
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/live")
 def live_matches():
     try:
