@@ -24,7 +24,7 @@
       --text2:     #8fa3be;
       --text3:     #4a6080;
       --r:         8px;
-      --rs:        5px;
+      --rs:         5px;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: "Segoe UI", system-ui, sans-serif; font-size: 13px; }
@@ -765,7 +765,6 @@ async function loadBracket() {
     let thirdPlace=null;
     for(const m of matches){
       if(m.stage==="THIRD_PLACE"){thirdPlace=m;continue;}
-      // map LAST_32/LAST_16 to standard nomenclature if needed
       const mappedStage = m.stage==="LAST_32"?"ROUND_OF_32":m.stage==="LAST_16"?"ROUND_OF_16":m.stage;
       if(byRound[mappedStage]) byRound[mappedStage].push(m);
     }
@@ -999,7 +998,7 @@ function loadTab(tab){
   if(tab==="recent")      loadRecent();
   if(tab==="upcoming")    loadUpcoming();
   if(tab==="standings")   loadStandings();
-  if(tab==="knockout")    loadKnockout(); // Added missing tab registry
+  if(tab==="knockout")    loadKnockout(); 
   if(tab==="bracket")     loadBracket();
   if(tab==="scorers")     loadScorers();
   if(tab==="predictions") loadPredictions();
